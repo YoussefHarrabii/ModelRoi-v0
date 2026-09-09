@@ -25,13 +25,14 @@ The system provides a FastAPI backend, a Streamlit dashboard for interaction and
 ```mermaid
 flowchart TD
     User[User] --> Dashboard[Streamlit Dashboard]
-    Dashboard -->|HTTP Request| API[FastAPI API]
-    API -->|Starts background task| Worker[LangGraph Workflow]
-    Worker -->|Queries| Ollama[Ollama Engine]
-    Worker -->|Reads/Writes| DB[(SQLite Database)]
-    Worker -->|Calls| Calc[Calculator / ROI Models]
-    Dashboard -->|Polling| API
-    API -->|Serves status & history| Dashboard
+    Dashboard -->|1. Trigger benchmark<br>& poll status| API[FastAPI API]
+    API -->|2. Start background task| Worker[LangGraph Workflow]
+    Worker -->|3. Run inference| Ollama[Ollama Engine]
+    Worker -->|4. Compute financials| Calc[Calculator / ROI Models]
+    Worker -->|5. Write results| DB[(SQLite Database)]
+    API -->|6. Serve run status| Dashboard
+    Dashboard -->|7. Read historical data<br>for charts & tables| DB
+
 ```
 
 The evaluation workflow is implemented as a stateful LangGraph, handling multiple models sequentially (because I could not use parallel on my laptop GPU) with progress tracking and error recovery.
