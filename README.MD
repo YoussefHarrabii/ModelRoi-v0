@@ -11,7 +11,7 @@ This project helps answer a practical question: *At what request volume does run
 It does this by:
 
 - Running a retrieval‑based benchmark (paragraph selection) on any Ollama‑compatible model.
-- Measuring accuracy (F1), latency (TTFT, TPS), and token usage.
+- Measuring accuracy, latency (TTFT, TPS), and token usage.
 - Simulating cloud costs using configurable per‑token pricing.
 - Modeling hardware TCO (Total Cost of Ownership) for a user‑defined GPU cluster.
 - Calculating breakeven points and capacity (max RPS) to inform deployment decisions.
