@@ -42,7 +42,7 @@ The evaluation workflow is implemented as a stateful LangGraph, handling multipl
 ## Features
 
 - **Multi‑model benchmarking** – test any model available in your Ollama instance.
-- **Retrieval‑augmented task** – models must extract relevant paragraphs from a document given a query; scoring uses Precision, Recall, and F1.
+- **Retrieval‑augmented task** – models must classify paragraphs into 8 categories
 - **Hardware modelling** – define cluster specifications (GPU count, VRAM, power draw, admin overhead) to compute monthly TCO.
 - **Cloud cost simulation** – use fictional per‑1k‑token pricing (input/output) to estimate API costs.
 - **Breakeven & capacity analysis** – determine the monthly request volume at which the cluster becomes cheaper, and check if the cluster can handle a target RPS.
