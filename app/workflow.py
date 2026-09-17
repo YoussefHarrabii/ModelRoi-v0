@@ -90,7 +90,7 @@ def run_task_evaluation(
     # ---- Original evaluation loop ----
     run_results = []
     total = len(test_cases)
-    print(f"🔍 Starting evaluation for {model_name} on {total} cases")
+    print(f"Starting evaluation for {model_name} on {total} cases")
 
     for idx, case in enumerate(test_cases, start=1):
         print(f"  Case {idx}/{total}: building prompt...")
@@ -180,7 +180,7 @@ def run_task_evaluation(
         if os.path.exists(failed_path):
             os.remove(failed_path)
 
-    print(f"📁 Logged {len(passed)} passed, {len(failed)} failed for {model_name} (overwritten)")
+    print(f"Logged {len(passed)} passed, {len(failed)} failed for {model_name} (overwritten)")
 
     return raw_run_data
 
