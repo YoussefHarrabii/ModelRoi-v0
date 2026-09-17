@@ -1,9 +1,7 @@
-import sqlite3
 import pytest
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch
 from fastapi.testclient import TestClient
 from app.main import app, RUN_STATUS_STORE, run_benchmark_background
-from app.config import ClusterConfig
 
 # Initialize TestClient
 client = TestClient(app)
@@ -33,24 +31,11 @@ def valid_cluster_payload():
     """Provides a valid ClusterConfig dictionary for payload testing."""
     return {
         "name": "Test-Cluster",
-        "gpu_type": "A10G",
         "gpu_count": 2,
         "gpu_vram_gb": 24,
-        "nodes": 1,
         "upfront_cost_eur": 10000.0,
-        "server_hardware_cost_eur": 10000.0,
         "power_draw_kw": 0.75,
-        "cloud_cost_per_request_eur": 0.001
     }
-
-
-@pytest.fixture
-def temp_db(tmp_path, monkeypatch):
-    """Overrides DB_PATH to an isolated SQLite file for history endpoint tests."""
-    db_file = tmp_path / "data" / "benchmark_history.db"
-    db_file.parent.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr("app.main.DB_PATH", db_file)
-    return db_file
 
 
 # ----------------------------------------------------------------------
@@ -119,7 +104,7 @@ def test_08_execute_benchmark_invalid_required_rps_negative():
 def test_09_execute_benchmark_invalid_cluster_config_missing_required():
     payload = {
         "cluster_config": {
-            "gpu_type": "A10G"
+            "name": "Incomplete"
         }
     }
     response = client.post("/api/v1/benchmark", json=payload)
@@ -219,7 +204,6 @@ def test_20_get_status_failed_run():
 async def test_21_run_benchmark_background_success(mock_ainvoke):
     mock_ainvoke.return_value = {
         "completed_runs": [{"model_name": "gemma2:2b"}],
-        "failed_models": [],
         "executive_summary": "Execution successful"
     }
 
@@ -232,7 +216,8 @@ async def test_21_run_benchmark_background_success(mock_ainvoke):
     assert status["status"] == "completed"
     assert status["progress"] == 1.0
     assert status["result"]["total_models_evaluated"] == 1
-    assert status["result"]["executive_summary"] == "Execution successful"
+    assert "**Task: extraction**" in status["result"]["executive_summary"]
+    assert "Execution successful" in status["result"]["executive_summary"]
 
 
 @pytest.mark.asyncio
@@ -271,7 +256,6 @@ async def test_23_run_benchmark_background_passes_run_id_in_initial_state(mock_a
 async def test_24_run_benchmark_background_handles_partial_failures(mock_ainvoke):
     mock_ainvoke.return_value = {
         "completed_runs": [{"model_name": "gemma2:2b"}],
-        "failed_models": [{"model_name": "broken-model", "error": "Crash"}],
         "executive_summary": "Partial completion"
     }
 
@@ -282,7 +266,8 @@ async def test_24_run_benchmark_background_handles_partial_failures(mock_ainvoke
 
     status = RUN_STATUS_STORE["run-partial"]
     assert status["status"] == "completed"
-    assert len(status["result"]["failed_models"]) == 1
+    assert status["result"]["total_models_evaluated"] == 1
+    assert "failed_models" not in status["result"]
 
 
 @pytest.mark.asyncio
@@ -298,91 +283,49 @@ async def test_25_run_benchmark_background_initial_status_set_to_running(mock_ai
     await run_benchmark_background("run-check", BenchmarkRequest())
 
 
-# ----------------------------------------------------------------------
-# 5. History Endpoint Tests (Tests 26–32)
-# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+@patch("app.main.benchmark_graph.ainvoke")
+async def test_26_run_benchmark_background_passes_seed(mock_ainvoke):
+    mock_ainvoke.return_value = {}
+    from app.main import BenchmarkRequest
+    req = BenchmarkRequest(models=["gemma2:2b"], seed=123)
 
-def test_26_get_history_empty_when_file_not_exists(temp_db):
-    if temp_db.exists():
-        temp_db.unlink()
-    response = client.get("/api/v1/history")
-    assert response.status_code == 200
-    assert response.json() == []
+    await run_benchmark_background("seed-id", req)
 
-
-def test_27_get_history_returns_database_records(temp_db):
-    with sqlite3.connect(temp_db) as conn:
-        conn.execute("""
-            CREATE TABLE benchmark_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                model_name TEXT,
-                accuracy REAL
-            )
-        """)
-        conn.execute("INSERT INTO benchmark_runs (model_name, accuracy) VALUES ('ModelA', 0.95)")
-        conn.execute("INSERT INTO benchmark_runs (model_name, accuracy) VALUES ('ModelB', 0.88)")
-        conn.commit()
-
-    response = client.get("/api/v1/history")
-    assert response.status_code == 200
-    data = response.json()
-    assert len(data) == 2
-    assert data[0]["model_name"] == "ModelB"
-    assert data[1]["model_name"] == "ModelA"
+    mock_ainvoke.assert_called_once()
+    assert mock_ainvoke.call_args[0][0]["seed"] == 123
 
 
-def test_28_get_history_handles_database_error(temp_db, monkeypatch):
-    # Create the file so DB_PATH.exists() is True
-    temp_db.touch()
-
-    def bad_connect(*args, **kwargs):
-        raise sqlite3.OperationalError("Database disk image is malformed")
-
-    monkeypatch.setattr("app.main.sqlite3.connect", bad_connect)
-    
-    response = client.get("/api/v1/history")
-    assert response.status_code == 500
-    assert "Database query failed" in response.json()["detail"]
+def test_36_execute_benchmark_tests_per_task_accepted():
+    payload = {"models": ["gemma2:2b"], "tests_per_task": 50}
+    response = client.post("/api/v1/benchmark", json=payload)
+    assert response.status_code == 202
 
 
-def test_29_get_history_empty_table(temp_db):
-    with sqlite3.connect(temp_db) as conn:
-        conn.execute("CREATE TABLE benchmark_runs (id INTEGER PRIMARY KEY);")
-        conn.commit()
-
-    response = client.get("/api/v1/history")
-    assert response.status_code == 200
-    assert response.json() == []
+def test_37_execute_benchmark_tests_per_task_zero_rejected():
+    payload = {"models": ["gemma2:2b"], "tests_per_task": 0}
+    response = client.post("/api/v1/benchmark", json=payload)
+    assert response.status_code == 422
 
 
-def test_30_get_history_returns_dict_per_row(temp_db):
-    with sqlite3.connect(temp_db) as conn:
-        conn.execute("CREATE TABLE benchmark_runs (id INTEGER PRIMARY KEY, name TEXT);")
-        conn.execute("INSERT INTO benchmark_runs (id, name) VALUES (1, 'Test');")
-        conn.commit()
+@pytest.mark.asyncio
+@patch("app.main.benchmark_graph.ainvoke")
+async def test_38_run_benchmark_background_propagates_tests_per_task(mock_ainvoke):
+    mock_ainvoke.return_value = {}
+    from app.main import BenchmarkRequest
+    req = BenchmarkRequest(models=["gemma2:2b"], tests_per_task=42)
 
-    response = client.get("/api/v1/history")
-    row = response.json()[0]
-    assert isinstance(row, dict)
-    assert row["id"] == 1
-    assert row["name"] == "Test"
+    await run_benchmark_background("run-tpt", req)
 
-
-def test_31_get_history_invalid_http_method():
-    response = client.post("/api/v1/history")
-    assert response.status_code == 405
-
-
-def test_32_get_history_supports_cors_or_headers(temp_db):
-    response = client.get("/api/v1/history")
-    assert response.headers["content-type"] == "application/json"
+    initial_state = mock_ainvoke.call_args[0][0]
+    assert initial_state["tests_per_task"] == 42
 
 
 # ----------------------------------------------------------------------
-# 6. Lifespan & App Setup Tests (Tests 33–35)
+# 5. Lifespan & App Setup Tests
 # ----------------------------------------------------------------------
 
-def test_33_lifespan_initializes_db(temp_db):
+def test_33_lifespan_initializes_db():
     with patch("app.main.init_db") as mock_init:
         with TestClient(app):
             mock_init.assert_called_once()

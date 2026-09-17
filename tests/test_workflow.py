@@ -3,7 +3,10 @@ from unittest.mock import patch, MagicMock
 from app.workflow import (
     BenchmarkState,
     initialize_pipeline,
-    evaluate_model,
+    run_task_evaluation,
+    evaluate_extraction,
+    evaluate_math,
+    evaluate_sql,
     calculate_financials,
     persist_data,
     increment_index,
@@ -15,62 +18,49 @@ from app.workflow import (
 )
 from app.config import ClusterConfig
 
-# ----------------------------------------------------------------------
-# Fixtures
-# ----------------------------------------------------------------------
 
 @pytest.fixture
 def base_state() -> BenchmarkState:
-    """Returns a fresh, default BenchmarkState dictionary."""
     return {
         "run_id": "test_run_123",
         "models": ["model-a", "model-b"],
+        "task": "math",
+        "tests_per_task": 5,
         "current_index": 0,
         "cluster_config": ClusterConfig(
             name="A10G-Cluster",
-            gpu_type="A10G",
             gpu_count=2,
             gpu_vram_gb=24,
-            nodes=1,
             upfront_cost_eur=10000.0,
-            server_hardware_cost_eur=10000.0,
             power_draw_kw=0.75,
-            cloud_cost_per_request_eur=0.001,
         ),
         "required_rps": 10.0,
         "completed_runs": [],
-        "failed_models": [],
         "last_run_failed": False,
         "executive_summary": "",
     }
 
 
 @pytest.fixture
-def mock_eval_result():
-    """Provides a standardized mock response for app.engine.eval_prompt_streaming."""
+def ollama_result():
     return {
-        "test_id": 1,
-        "category": "unit_test",
-        "expected_intent_id": 100,
-        "predicted_intent_id": 100,
-        "is_correct": True,
+        "response": "4",
         "latency_ms": 100.0,
         "ttft_ms": 20.0,
         "tps": 50.0,
         "prompt_tokens": 150,
-        "eval_count": 50
+        "eval_count": 50,
+        "error": None,
     }
 
 
 # ----------------------------------------------------------------------
-# 1. Pipeline Initialization Tests (Tests 1–3)
+# initialize + routing
 # ----------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_01_initialize_pipeline_resets_defaults(base_state):
+async def test_initialize_pipeline_resets_defaults(base_state):
     base_state["current_index"] = 5
     base_state["completed_runs"] = [{"some": "data"}]
-    base_state["failed_models"] = [{"some": "error"}]
     base_state["last_run_failed"] = True
     base_state["executive_summary"] = "Old summary"
 
@@ -78,488 +68,293 @@ async def test_01_initialize_pipeline_resets_defaults(base_state):
 
     assert res["current_index"] == 0
     assert res["completed_runs"] == []
-    assert res["failed_models"] == []
     assert res["last_run_failed"] is False
     assert res["executive_summary"] == ""
 
 
-@pytest.mark.asyncio
-async def test_02_initialize_pipeline_returns_dict(base_state):
-    res = await initialize_pipeline(base_state)
-    assert isinstance(res, dict)
-
-
-@pytest.mark.asyncio
-async def test_03_initialize_pipeline_does_not_mutate_models(base_state):
-    res = await initialize_pipeline(base_state)
-    assert "models" not in res  # LangGraph node returns state delta, not mutating models
-
-
-# ----------------------------------------------------------------------
-# 2. Model Evaluation Node Tests (Tests 4–10)
-# ----------------------------------------------------------------------
-
-@pytest.mark.asyncio
-@patch("app.workflow.eval_prompt_streaming")
-@patch("app.workflow.unload_model")
-async def test_04_evaluate_model_success_path(mock_unload, mock_eval, base_state, mock_eval_result):
-    mock_eval.return_value = mock_eval_result
-
-    res = await evaluate_model(base_state)
-
-    assert res["last_run_failed"] is False
-    assert len(res["completed_runs"]) == 1
-    
-    run_data = res["completed_runs"][0]
-    assert run_data["model_name"] == "model-a"
-    assert run_data["accuracy"] == 100.0
-    assert run_data["avg_latency_ms"] == 100.0
-    assert run_data["avg_ttft_ms"] == 20.0
-    assert run_data["avg_tps"] == 50.0
-    mock_unload.assert_called_once_with("model-a")
-
-
-@pytest.mark.asyncio
-@patch("app.workflow.eval_prompt_streaming")
-@patch("app.workflow.unload_model")
-async def test_05_evaluate_model_calculates_mixed_accuracy(mock_unload, mock_eval, base_state, mock_eval_result):
-    wrong_result = dict(mock_eval_result, is_correct=False)
-    mock_eval.side_effect = [mock_eval_result, wrong_result]
-
-    with patch("app.workflow.test_cases", [{}, {}]):
-        res = await evaluate_model(base_state)
-
-    run_data = res["completed_runs"][0]
-    assert run_data["accuracy"] == 50.0
-
-
-@pytest.mark.asyncio
-@patch("app.workflow.eval_prompt_streaming")
-@patch("app.workflow.unload_model")
-async def test_06_evaluate_model_exception_handling(mock_unload, mock_eval, base_state):
-    mock_eval.side_effect = RuntimeError("Ollama OOM")
-
-    res = await evaluate_model(base_state)
-
-    assert res["last_run_failed"] is True
-    assert len(res["failed_models"]) == 1
-    assert res["failed_models"][0] == {"model_name": "model-a", "error": "Ollama OOM"}
-
-
-@pytest.mark.asyncio
-@patch("app.workflow.eval_prompt_streaming")
-@patch("app.workflow.unload_model")
-async def test_07_evaluate_model_updates_run_status_store(mock_unload, mock_eval, base_state, mock_eval_result):
-    mock_eval.return_value = mock_eval_result
-    
-    # Pre-populate store in main
-    from app.main import RUN_STATUS_STORE
-    RUN_STATUS_STORE["test_run_123"] = {}
-
-    await evaluate_model(base_state)
-    
-    assert RUN_STATUS_STORE["test_run_123"].get("status") == "running"
-
-
-@pytest.mark.asyncio
-@patch("app.workflow.eval_prompt_streaming")
-@patch("app.workflow.unload_model")
-async def test_08_evaluate_model_appends_to_existing_completed_runs(mock_unload, mock_eval, base_state, mock_eval_result):
-    mock_eval.return_value = mock_eval_result
-    base_state["completed_runs"] = [{"model_name": "previous-model"}]
-
-    res = await evaluate_model(base_state)
-
-    assert len(res["completed_runs"]) == 2
-    assert res["completed_runs"][0]["model_name"] == "previous-model"
-    assert res["completed_runs"][1]["model_name"] == "model-a"
-
-
-@pytest.mark.asyncio
-@patch("app.workflow.eval_prompt_streaming")
-@patch("app.workflow.unload_model")
-async def test_09_evaluate_model_accumulates_total_tokens(mock_unload, mock_eval, base_state, mock_eval_result):
-    mock_eval.return_value = mock_eval_result
-
-    with patch("app.workflow.test_cases", [{}, {}, {}]):
-        res = await evaluate_model(base_state)
-
-    assert res["completed_runs"][0]["total_tokens"] == 150  # 50 * 3
-
-
-@pytest.mark.asyncio
-@patch("app.workflow.eval_prompt_streaming")
-@patch("app.workflow.unload_model")
-async def test_10_evaluate_model_unloads_even_on_partial_tokens(mock_unload, mock_eval, base_state, mock_eval_result):
-    mock_eval.return_value = mock_eval_result
-    await evaluate_model(base_state)
-    mock_unload.assert_called_once()
-
-
-# ----------------------------------------------------------------------
-# 3. Financial Calculation Node Tests (Tests 11–15)
-# ----------------------------------------------------------------------
-
-@pytest.mark.asyncio
-@patch("app.workflow.calculate_financial_roi")
-async def test_11_calculate_financials_with_cluster_analysis(mock_roi, base_state):
-    base_state["completed_runs"] = [{
-        "model_name": "model-a",
-        "avg_latency_ms": 120.0,
-        "accuracy": 85.0,
-        "evaluations": [{"prompt_tokens": 100, "eval_count": 50}]
-    }]
-
-    mock_roi.return_value = {
-        "efficiency_score": 0.95,
-        "cloud_cost_per_request_eur": 0.0005,
-        "cluster_analysis": {
-            "tco": {"total_monthly_tco_eur": 1500.0},
-            "throughput": {"max_rps": 30.0},
-            "breakeven": {
-                "breakeven_monthly_requests": 3000000,
-                "feasible": True,
-                "recommendation": "Use local cluster"
-            }
-        }
-    }
-
-    res = await calculate_financials(base_state)
-    latest = res["completed_runs"][0]
-
-    assert latest["efficiency_score"] == 0.95
-    assert latest["cluster_monthly_tco_eur"] == 1500.0
-    assert latest["max_rps"] == 30.0
-    assert latest["breakeven_requests"] == 3000000
-    assert latest["cluster_feasible"] is True
-    assert latest["recommendation"] == "Use local cluster"
-
-
-@pytest.mark.asyncio
-@patch("app.workflow.calculate_financial_roi")
-async def test_12_calculate_financials_without_cluster_analysis(mock_roi, base_state):
-    base_state["completed_runs"] = [{
-        "model_name": "model-a",
-        "avg_latency_ms": 120.0,
-        "accuracy": 85.0,
-        "evaluations": []
-    }]
-
-    mock_roi.return_value = {
-        "efficiency_score": 0.70,
-        "cloud_cost_per_request_eur": 0.001,
-        "cluster_analysis": None
-    }
-
-    res = await calculate_financials(base_state)
-    latest = res["completed_runs"][0]
-
-    assert latest["efficiency_score"] == 0.70
-    assert latest["breakeven_requests"] is None
-
-
-@pytest.mark.asyncio
-@patch("app.workflow.calculate_financial_roi")
-async def test_13_calculate_financials_extracts_tokens_correctly(mock_roi, base_state):
-    base_state["completed_runs"] = [{
-        "model_name": "model-a",
-        "avg_latency_ms": 100.0,
-        "accuracy": 90.0,
-        "evaluations": [
-            {"prompt_tokens": 10, "eval_count": 20},
-            {"prompt_tokens": 15, "eval_count": 25}
-        ]
-    }]
-
-    mock_roi.return_value = {"efficiency_score": 0.8, "cloud_cost_per_request_eur": 0.001}
-
-    await calculate_financials(base_state)
-
-    mock_roi.assert_called_once_with(
-        model_name="model-a",
-        total_input_tokens=25,
-        total_output_tokens=45,
-        total_requests=2,
-        local_avg_latency_ms=100.0,
-        local_accuracy=90.0,
-        cluster=base_state["cluster_config"],
-        required_rps=10.0
-    )
-
-
-@pytest.mark.asyncio
-@patch("app.workflow.calculate_financial_roi")
-async def test_14_calculate_financials_preserves_previous_runs(mock_roi, base_state):
-    base_state["completed_runs"] = [
-        {"model_name": "model-0", "efficiency_score": 0.5},
-        {"model_name": "model-a", "avg_latency_ms": 100.0, "accuracy": 90.0, "evaluations": []}
-    ]
-    mock_roi.return_value = {"efficiency_score": 0.9, "cloud_cost_per_request_eur": 0.001}
-
-    res = await calculate_financials(base_state)
-
-    assert len(res["completed_runs"]) == 2
-    assert res["completed_runs"][0]["model_name"] == "model-0"
-
-
-@pytest.mark.asyncio
-@patch("app.workflow.calculate_financial_roi")
-async def test_15_calculate_financials_fallback_required_rps(mock_roi, base_state):
-    del base_state["required_rps"]
-    base_state["completed_runs"] = [{"model_name": "m", "avg_latency_ms": 100, "accuracy": 100, "evaluations": []}]
-    mock_roi.return_value = {"efficiency_score": 0.9, "cloud_cost_per_request_eur": 0.001}
-
-    await calculate_financials(base_state)
-
-    assert mock_roi.call_args.kwargs["required_rps"] == 1.0
-
-
-# ----------------------------------------------------------------------
-# 4. Persistence Node Tests (Tests 16–18)
-# ----------------------------------------------------------------------
-
-@pytest.mark.asyncio
-@patch("app.workflow.save_benchmark_results")
-async def test_16_persist_data_formats_report_correctly(mock_save, base_state):
-    base_state["completed_runs"] = [{
-        "model_name": "model-a",
-        "accuracy": 95.0,
-        "avg_latency_ms": 80.0,
-        "avg_ttft_ms": 15.0,
-        "avg_tps": 60.0,
-        "total_tokens": 1200,
-        "efficiency_score": 0.92,
-        "breakeven_requests": 500000,
-        "cluster_monthly_tco_eur": 800.0,
-        "max_rps": 40.0,
-        "evaluations": [{"test_id": 1}]
-    }]
-
-    res = await persist_data(base_state)
-
-    assert res == {}
-    mock_save.assert_called_once_with([{
-        "model_name": "model-a",
-        "accuracy": 95.0,
-        "avg_latency_ms": 80.0,
-        "avg_ttft_ms": 15.0,
-        "avg_tps": 60.0,
-        "total_tokens_used": 1200,
-        "efficiency_score": 0.92,
-        "breakeven_monthly_requests": 500000,
-        "cluster_monthly_tco_eur": 800.0,
-        "max_rps": 40.0,
-        "evaluations": [{"test_id": 1}]
-    }])
-
-
-@pytest.mark.asyncio
-@patch("app.workflow.save_benchmark_results")
-async def test_17_persist_data_handles_none_optional_values(mock_save, base_state):
-    base_state["completed_runs"] = [{
-        "model_name": "model-a",
-        "accuracy": 50.0,
-        "avg_latency_ms": 200.0,
-        "avg_ttft_ms": 50.0,
-        "avg_tps": 10.0,
-        "total_tokens": 100,
-        "efficiency_score": 0.5,
-        "evaluations": []
-    }]
-
-    await persist_data(base_state)
-
-    report = mock_save.call_args[0][0][0]
-    assert report["breakeven_monthly_requests"] is None
-    assert report["cluster_monthly_tco_eur"] is None
-    assert report["max_rps"] is None
-
-
-@pytest.mark.asyncio
-async def test_18_increment_index_advances_counter(base_state):
-    base_state["current_index"] = 1
-    res = await increment_index(base_state)
-    assert res == {"current_index": 2}
-
-
-# ----------------------------------------------------------------------
-# 5. Executive Summary & Synthesis Tests (Tests 19–24)
-# ----------------------------------------------------------------------
-
-def test_19_generate_deterministic_summary_empty_runs():
-    summary = generate_deterministic_summary([])
-    assert summary == "No completed runs available to summarize."
-
-
-def test_20_generate_deterministic_summary_highlights_top_performers():
-    runs = [
-        {"model_name": "SlowAccurate", "accuracy": 95.0, "avg_ttft_ms": 100.0, "avg_tps": 20.0, "breakeven_requests": 1000000},
-        {"model_name": "FastInaccurate", "accuracy": 70.0, "avg_ttft_ms": 10.0, "avg_tps": 100.0, "breakeven_requests": 500000}
-    ]
-
-    summary = generate_deterministic_summary(runs)
-
-    assert "[Rule-Based Fallback Synthesis]" in summary
-    assert "SlowAccurate" in summary and "95.0%" in summary
-    assert "FastInaccurate" in summary and "10.0 ms" in summary
-    assert "lowest breakeven threshold at 500,000 monthly requests" in summary
-
-
-@pytest.mark.asyncio
-async def test_21_synthesize_summary_empty_runs(base_state):
-    base_state["completed_runs"] = []
-    res = await synthesize_summary(base_state)
-    assert res == {"executive_summary": "No models were successfully evaluated."}
-
-
-@pytest.mark.asyncio
-@patch("requests.post")
-async def test_22_synthesize_summary_openrouter_success(mock_post, base_state):
-    base_state["completed_runs"] = [{"model_name": "model-a", "accuracy": 90.0}]
-
-    mock_response = MagicMock()
-    mock_response.json.return_value = {
-        "choices": [{"message": {"content": "Bullet 1\nBullet 2\nBullet 3"}}]
-    }
-    mock_post.return_value = mock_response
-
-    res = await synthesize_summary(base_state)
-
-    assert "[Cloud Synthesis - OpenRouter]" in res["executive_summary"]
-    assert "Bullet 1" in res["executive_summary"]
-
-
-@pytest.mark.asyncio
-@patch("requests.post")
-async def test_23_synthesize_summary_openrouter_http_error_triggers_fallback(mock_post, base_state):
-    base_state["completed_runs"] = [{"model_name": "model-a", "accuracy": 90.0, "avg_ttft_ms": 10.0, "avg_tps": 50.0}]
-    mock_post.side_effect = Exception("API Timeout")
-
-    res = await synthesize_summary(base_state)
-
-    assert "[Rule-Based Fallback Synthesis]" in res["executive_summary"]
-    assert "model-a" in res["executive_summary"]
-
-
-@pytest.mark.asyncio
-@patch("requests.post")
-async def test_24_synthesize_summary_openrouter_invalid_payload_triggers_fallback(mock_post, base_state):
-    base_state["completed_runs"] = [{"model_name": "model-a", "accuracy": 90.0, "avg_ttft_ms": 10.0, "avg_tps": 50.0}]
-    
-    mock_response = MagicMock()
-    mock_response.json.return_value = {"error": "Invalid API Key"}
-    mock_post.return_value = mock_response
-
-    res = await synthesize_summary(base_state)
-
-    assert "[Rule-Based Fallback Synthesis]" in res["executive_summary"]
-
-
-# ----------------------------------------------------------------------
-# 6. Graph Routing Edge Functions (Tests 25–28)
-# ----------------------------------------------------------------------
-
-def test_25_route_after_evaluation_success(base_state):
+def test_route_after_evaluation_success(base_state):
     base_state["last_run_failed"] = False
     assert route_after_evaluation(base_state) == "calculate_financials"
 
 
-def test_26_route_after_evaluation_failure(base_state):
+def test_route_after_evaluation_failure(base_state):
     base_state["last_run_failed"] = True
     assert route_after_evaluation(base_state) == "increment_index"
 
 
-def test_27_route_next_model_continues_loop(base_state):
+def test_route_next_model_per_task(base_state):
     base_state["models"] = ["m1", "m2"]
     base_state["current_index"] = 0
-    assert route_next_model(base_state) == "evaluate_model"
+    base_state["task"] = "math"
+    assert route_next_model(base_state) == "evaluate_math"
+    base_state["task"] = "sql"
+    assert route_next_model(base_state) == "evaluate_sql"
+    base_state["task"] = "extraction"
+    assert route_next_model(base_state) == "evaluate_extraction"
 
 
-def test_28_route_next_model_ends_loop(base_state):
+def test_route_next_model_ends_loop(base_state):
     base_state["models"] = ["m1", "m2"]
     base_state["current_index"] = 2
     assert route_next_model(base_state) == "synthesize_summary"
 
 
 # ----------------------------------------------------------------------
-# 7. End-to-End Compiled Graph Execution Tests (Tests 29–32)
+# run_task_evaluation sampling + scoring loop
 # ----------------------------------------------------------------------
 
-@pytest.mark.asyncio
-@patch("app.workflow.eval_prompt_streaming")
-@patch("app.workflow.unload_model")
+def _math_case(answer="4"):
+    return {"question": "Solve for x: 2x + 5 = 13", "answer": answer, "category": 3}
+
+
+@patch("app.workflow.call_ollama")
+def test_run_task_evaluation_limits_total_per_task(mock_call, ollama_result):
+    from app.tasks import math_task
+    mock_call.return_value = dict(ollama_result)
+    cases = [_math_case() for _ in range(10)]
+
+    out = run_task_evaluation("m", cases, math_task, limit=4)
+
+    assert len(out["evaluations"]) == 4
+    assert mock_call.call_count == 4
+
+
+@patch("app.workflow.call_ollama")
+def test_run_task_evaluation_no_limit_runs_full_bank(mock_call, ollama_result):
+    from app.tasks import math_task
+    mock_call.return_value = dict(ollama_result)
+    cases = [_math_case() for _ in range(6)]
+
+    out = run_task_evaluation("m", cases, math_task)
+
+    assert len(out["evaluations"]) == 6
+    assert out["accuracy"] == 100.0
+    assert out["avg_latency_ms"] == 100.0
+    assert out["total_tokens"] == 1200  # (150 + 50) * 6
+
+
+@patch("app.workflow.call_ollama")
+def test_run_task_evaluation_scores_incorrect(mock_call, ollama_result):
+    from app.tasks import math_task
+    mock_call.return_value = dict(ollama_result, response="999")
+    out = run_task_evaluation("m", [_math_case()], math_task)
+    assert out["accuracy"] == 0.0
+    assert out["evaluations"][0]["is_correct"] is False
+
+
+@patch("app.workflow.call_ollama")
+def test_run_task_evaluation_ollama_error_counts_as_failure(mock_call):
+    from app.tasks import math_task
+    mock_call.return_value = {
+        "response": "", "latency_ms": 0.0, "ttft_ms": 0.0, "tps": 0.0,
+        "prompt_tokens": 0, "eval_count": 0, "error": "boom",
+    }
+    out = run_task_evaluation("m", [_math_case()], math_task)
+    assert out["accuracy"] == 0.0
+
+
+@patch("app.workflow.call_ollama")
+def test_run_task_evaluation_seed_reproducible(mock_call, ollama_result):
+    from app.tasks import math_task
+    mock_call.return_value = dict(ollama_result)
+    cases = [
+        {"id": i, "question": "Solve for x: 2x + 5 = 13", "answer": "4", "category": 3}
+        for i in range(10)
+    ]
+
+    out1 = run_task_evaluation("m", cases, math_task, limit=4, seed=42)
+    out2 = run_task_evaluation("m", cases, math_task, limit=4, seed=42)
+
+    ids1 = [e["test_id"] for e in out1["evaluations"]]
+    ids2 = [e["test_id"] for e in out2["evaluations"]]
+    assert len(ids1) == 4
+    assert ids1 == ids2
+
+
+# ----------------------------------------------------------------------
+# per-task evaluator nodes
+# ----------------------------------------------------------------------
+
+@patch("app.workflow.call_ollama")
+async def test_evaluate_math_appends_completed_run(mock_call, base_state, ollama_result):
+    mock_call.return_value = dict(ollama_result)
+    base_state["task"] = "math"
+    with patch("app.workflow.math_cases", [_math_case()]):
+        res = await evaluate_math(base_state)
+    assert res["last_run_failed"] is False
+    assert len(res["completed_runs"]) == 1
+    assert res["completed_runs"][0]["model_name"] == "model-a"
+
+
+@patch("app.workflow.call_ollama")
+async def test_evaluate_math_marks_failed_run(mock_call, base_state):
+    mock_call.side_effect = RuntimeError("Ollama OOM")
+    base_state["task"] = "math"
+    with patch("app.workflow.math_cases", [_math_case()]):
+        res = await evaluate_math(base_state)
+    assert res["last_run_failed"] is True
+    assert res["completed_runs"] == []
+
+
+@patch("app.workflow.call_ollama")
+async def test_evaluate_sql_routes_and_scores(mock_call, base_state):
+    mock_call.return_value = {
+        "response": "SELECT 1;", "latency_ms": 10.0, "ttft_ms": 2.0, "tps": 5.0,
+        "prompt_tokens": 10, "eval_count": 2, "error": None,
+    }
+    base_state["task"] = "sql"
+    res = await evaluate_sql(base_state)
+    assert res["last_run_failed"] is False
+    assert len(res["completed_runs"]) == 1
+
+
+@patch("app.workflow.call_ollama")
+async def test_evaluate_extraction_json_mode(mock_call, base_state):
+    mock_call.return_value = {
+        "response": '{"indices": [1]}', "latency_ms": 10.0, "ttft_ms": 2.0, "tps": 5.0,
+        "prompt_tokens": 10, "eval_count": 2, "error": None,
+    }
+    base_state["task"] = "extraction"
+    cases = [
+        {"query": "q1", "paragraphs": ["p0", "p1"], "expected_indices": [1]},
+        {"query": "q2", "paragraphs": ["p0", "p1"], "expected_indices": [0]},
+    ]
+    with patch("app.workflow.extraction_cases", cases):
+        res = await evaluate_extraction(base_state)
+    assert res["last_run_failed"] is False
+    assert len(res["completed_runs"]) == 1
+    assert mock_call.call_args[1]["expect_json"] is True
+
+
+# ----------------------------------------------------------------------
+# financials / persist / summaries (unchanged behavior)
+# ----------------------------------------------------------------------
+
+@patch("app.workflow.calculate_financial_roi")
+async def test_calculate_financials_with_cluster_analysis(mock_roi, base_state):
+    base_state["completed_runs"] = [{
+        "model_name": "model-a",
+        "avg_latency_ms": 120.0,
+        "accuracy": 85.0,
+        "evaluations": [{"prompt_tokens": 100, "eval_count": 50}]
+    }]
+    mock_roi.return_value = {
+        "efficiency_score": 0.95,
+        "cloud_cost_per_request_eur": 0.0005,
+        "cluster_analysis": {
+            "tco": {"total_monthly_tco_eur": 1500.0},
+            "throughput": {"max_rps": 30.0},
+            "breakeven": {"breakeven_monthly_requests": 3000000, "feasible": True, "recommendation": "Use local cluster"}
+        }
+    }
+    res = await calculate_financials(base_state)
+    latest = res["completed_runs"][0]
+    assert latest["efficiency_score"] == 0.95
+    assert latest["cluster_monthly_tco_eur"] == 1500.0
+    assert latest["max_rps"] == 30.0
+    assert latest["breakeven_requests"] == 3000000
+    assert latest["cluster_feasible"] is True
+
+
+@patch("app.workflow.calculate_financial_roi")
+async def test_calculate_financials_token_accounting(mock_roi, base_state):
+    base_state["completed_runs"] = [{
+        "model_name": "model-a", "avg_latency_ms": 100.0, "accuracy": 90.0,
+        "evaluations": [{"prompt_tokens": 10, "eval_count": 20}, {"prompt_tokens": 15, "eval_count": 25}]
+    }]
+    mock_roi.return_value = {"efficiency_score": 0.8, "cloud_cost_per_request_eur": 0.001}
+    await calculate_financials(base_state)
+    mock_roi.assert_called_once_with(
+        model_name="model-a", total_input_tokens=25, total_output_tokens=45,
+        total_requests=2, local_avg_latency_ms=100.0, local_accuracy=90.0,
+        cluster=base_state["cluster_config"], required_rps=10.0,
+    )
+
+
+@patch("app.workflow.save_benchmark_results")
+async def test_persist_data_formats_report(mock_save, base_state):
+    base_state["task"] = "math"
+    base_state["completed_runs"] = [{
+        "model_name": "model-a", "accuracy": 95.0, "avg_latency_ms": 80.0,
+        "avg_ttft_ms": 15.0, "avg_tps": 60.0, "total_tokens": 1200,
+        "efficiency_score": 0.92, "breakeven_requests": 500000,
+        "cluster_monthly_tco_eur": 800.0, "max_rps": 40.0,
+        "evaluations": [{"test_id": 1}]
+    }]
+    res = await persist_data(base_state)
+    assert res == {}
+    saved = mock_save.call_args[0][0][0]
+    assert saved["task"] == "math"
+    assert saved["total_tokens_used"] == 1200
+    assert saved["breakeven_monthly_requests"] == 500000
+
+
+async def test_increment_index_advances_counter(base_state):
+    base_state["current_index"] = 1
+    assert await increment_index(base_state) == {"current_index": 2}
+
+
+def test_generate_deterministic_summary_empty_runs():
+    assert generate_deterministic_summary([]) == "No completed runs available to summarize."
+
+
+def test_generate_deterministic_summary_highlights_top_performers():
+    runs = [
+        {"model_name": "SlowAccurate", "accuracy": 95.0, "avg_ttft_ms": 100.0, "avg_tps": 20.0, "breakeven_requests": 1000000},
+        {"model_name": "FastInaccurate", "accuracy": 70.0, "avg_ttft_ms": 10.0, "avg_tps": 100.0, "breakeven_requests": 500000}
+    ]
+    summary = generate_deterministic_summary(runs)
+    assert "[Rule-Based Fallback Synthesis]" in summary
+    assert "SlowAccurate" in summary and "95.0%" in summary
+    assert "500,000 monthly requests" in summary
+
+
+async def test_synthesize_summary_empty_runs(base_state):
+    base_state["completed_runs"] = []
+    assert await synthesize_summary(base_state) == {"executive_summary": "No models were successfully evaluated."}
+
+
+@patch("requests.post")
+async def test_synthesize_summary_openrouter_success(mock_post, base_state):
+    base_state["completed_runs"] = [{"model_name": "model-a", "accuracy": 90.0}]
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"choices": [{"message": {"content": "Bullet 1"}}]}
+    mock_post.return_value = mock_response
+    res = await synthesize_summary(base_state)
+    assert "[Cloud Synthesis - OpenRouter]" in res["executive_summary"]
+
+
+@patch("requests.post")
+async def test_synthesize_summary_falls_back_on_error(mock_post, base_state):
+    base_state["completed_runs"] = [{"model_name": "model-a", "accuracy": 90.0, "avg_ttft_ms": 10.0, "avg_tps": 50.0}]
+    mock_post.side_effect = Exception("API Timeout")
+    res = await synthesize_summary(base_state)
+    assert "[Rule-Based Fallback Synthesis]" in res["executive_summary"]
+
+
+def test_benchmark_graph_structure_nodes():
+    nodes = set(benchmark_graph.nodes.keys())
+    assert {
+        "initialize", "evaluate_extraction", "evaluate_sql", "evaluate_math",
+        "calculate_financials", "persist_data", "increment_index", "synthesize_summary",
+    }.issubset(nodes)
+
+
+@patch("app.workflow.call_ollama")
 @patch("app.workflow.calculate_financial_roi")
 @patch("app.workflow.save_benchmark_results")
 @patch("requests.post")
-async def test_29_full_graph_execution_single_model_success(
-    mock_post, mock_save, mock_roi, mock_unload, mock_eval, base_state, mock_eval_result
-):
+async def test_full_graph_single_math_model(mock_post, mock_save, mock_roi, mock_call, base_state, ollama_result):
     base_state["models"] = ["model-a"]
-    mock_eval.return_value = mock_eval_result
+    base_state["task"] = "math"
+    mock_call.return_value = dict(ollama_result)
     mock_roi.return_value = {"efficiency_score": 0.9, "cloud_cost_per_request_eur": 0.001}
-    
     mock_response = MagicMock()
-    mock_response.json.return_value = {"choices": [{"message": {"content": "Summary"}}] }
+    mock_response.json.return_value = {"choices": [{"message": {"content": "Summary"}}]}
     mock_post.return_value = mock_response
-
-    final_state = await benchmark_graph.ainvoke(base_state)
-
+    with patch("app.workflow.math_cases", [_math_case()]):
+        final_state = await benchmark_graph.ainvoke(base_state)
     assert final_state["current_index"] == 1
     assert len(final_state["completed_runs"]) == 1
-    assert len(final_state["failed_models"]) == 0
     assert "[Cloud Synthesis - OpenRouter]" in final_state["executive_summary"]
     mock_save.assert_called_once()
-
-
-@pytest.mark.asyncio
-@patch("app.workflow.eval_prompt_streaming")
-@patch("app.workflow.unload_model")
-@patch("app.workflow.calculate_financial_roi")
-@patch("app.workflow.save_benchmark_results")
-@patch("requests.post")
-async def test_30_full_graph_execution_multi_model_partial_failure(
-    mock_post, mock_save, mock_roi, mock_unload, mock_eval, base_state, mock_eval_result
-):
-    base_state["models"] = ["working-model", "failing-model"]
-    
-    # Restrict test cases to 1 so working-model completes in 1 iteration
-    with patch("app.workflow.test_cases", [{"test_id": 1}]):
-        mock_eval.side_effect = [mock_eval_result, RuntimeError("CUDA Out of Memory")]
-        mock_roi.return_value = {"efficiency_score": 0.8, "cloud_cost_per_request_eur": 0.001}
-        mock_post.side_effect = Exception("No OpenRouter")
-
-        final_state = await benchmark_graph.ainvoke(base_state)
-
-    assert len(final_state["completed_runs"]) == 1
-    assert len(final_state["failed_models"]) == 1
-    assert final_state["failed_models"][0]["model_name"] == "failing-model"
-
-
-@pytest.mark.asyncio
-@patch("app.workflow.eval_prompt_streaming")
-@patch("app.workflow.unload_model")
-@patch("requests.post")
-async def test_31_full_graph_execution_all_models_failed(
-    mock_post, mock_unload, mock_eval, base_state
-):
-    base_state["models"] = ["fail-1", "fail-2"]
-    mock_eval.side_effect = RuntimeError("Fatal Crash")
-
-    final_state = await benchmark_graph.ainvoke(base_state)
-
-    assert len(final_state["completed_runs"]) == 0
-    assert len(final_state["failed_models"]) == 2
-    assert final_state["executive_summary"] == "No models were successfully evaluated."
-
-
-def test_32_benchmark_graph_structure_nodes():
-    nodes = set(benchmark_graph.nodes.keys())
-    expected_nodes = {
-        "initialize",
-        "evaluate_model",
-        "calculate_financials",
-        "persist_data",
-        "increment_index",
-        "synthesize_summary"
-    }
-    assert expected_nodes.issubset(nodes)

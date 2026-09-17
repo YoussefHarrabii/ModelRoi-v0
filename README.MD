@@ -10,7 +10,7 @@ This project helps answer a practical question: *At what request volume does run
 
 It does this by:
 
-- Running a retrieval‑based benchmark (paragraph selection) on any Ollama‑compatible model.
+- Running three benchmarks (extraction, SQL, math) on any Ollama‑compatible model.
 - Measuring accuracy, latency (TTFT, TPS), and token usage.
 - Simulating cloud costs using configurable per‑token pricing.
 - Modeling hardware TCO (Total Cost of Ownership) for a user‑defined GPU cluster.
@@ -25,13 +25,16 @@ The system provides a FastAPI backend, a Streamlit dashboard for interaction and
 ```mermaid
 flowchart TD
     User[User] --> Dashboard[Streamlit Dashboard]
-    Dashboard -->|1. Trigger benchmark<br>& poll status| API[FastAPI API]
-    API -->|2. Start background task| Worker[LangGraph Workflow]
-    Worker -->|3. Run inference| Ollama[Ollama Engine]
+    Dashboard -->|1. Trigger benchmark<br>models, tasks, seed, cluster<br>& poll status| API[FastAPI API]
+    API -->|2. Background loop<br>one graph run per task| Worker[LangGraph Workflow]
+    Worker -->|3a. Extraction: JSON indices| Ollama[Ollama Engine]
+    Worker -->|3b. SQL: raw query| Ollama
+    Worker -->|3c. Math: plain answer| Ollama
     Worker -->|4. Compute financials| Calc[Calculator / ROI Models]
     Worker -->|5. Write results| DB[(SQLite Database)]
-    API -->|6. Serve run status| Dashboard
-    Dashboard -->|7. Read historical data<br>for charts & tables| DB
+    Worker -->|6. Executive summary| Cloud[OpenRouter<br>fallback: rule-based]
+    API -->|7. Serve run status| Dashboard
+    Dashboard -->|8. Read historical data<br>for charts & tables| DB
 
 ```
 
@@ -42,7 +45,8 @@ The evaluation workflow is implemented as a stateful LangGraph, handling multipl
 ## Features
 
 - **Multi‑model benchmarking** – test any model available in your Ollama instance.
-- **Retrieval‑augmented task** – models must classify paragraphs into 8 categories
+- **Three tasks** – extraction (pick relevant paragraph indices, scored P/R/F1), SQL (NL→query, scored by execution equivalence), math (plain-notation answers, scored by symbolic equivalence).
+- **Reproducible sampling** – cap tests per task and set a tunable random seed from the dashboard.
 - **Hardware modelling** – define cluster specifications (GPU count, VRAM, power draw, admin overhead) to compute monthly TCO.
 - **Cloud cost simulation** – use fictional per‑1k‑token pricing (input/output) to estimate API costs.
 - **Breakeven & capacity analysis** – determine the monthly request volume at which the cluster becomes cheaper, and check if the cluster can handle a target RPS.
@@ -103,22 +107,32 @@ The API will be available at `http://localhost:8000` and the dashboard at `http:
 ### Running a Benchmark
 
 1. In the dashboard sidebar, select one or more models (they must be already pulled in Ollama (and also add it in config.py).
-2. Configure your hardware cluster (GPU count, VRAM, power draw, etc.) and target RPS.
-3. Click **Execute Benchmark**.
-4. Watch the progress bar update as each model is evaluated.
-5. Once complete, the dashboard will refresh and display the results.
+2. Select the tasks to run (extraction, SQL, math), max tests per task, and the random seed (reuse it for reproducible runs).
+3. Configure your hardware cluster (GPU count, VRAM, power draw, etc.) and target RPS.
+4. Click **Execute Benchmark**.
+5. Watch the progress bar update as each model is evaluated.
+6. Once complete, the dashboard will refresh and display the results.
 
 ---
 
 ## How It Works
 
-### Benchmark Task
+### Benchmark Tasks
 
-The engine uses a custom dataset of queries paired with 10 paragraphs (numbered 0‑9). Each test case has a set of ground‑truth relevant paragraph indices.
+**Extraction.** Each test case pairs a query with 10 paragraphs (numbered 0‑9) plus ground‑truth relevant indices.
 
-- The model receives a system prompt instructing it to return a JSON object like `{"indices": [1, 4, 7]}`.
-- The response is parsed, and Precision/Recall/F1 are computed against the expected indices.
-- Aggregated metrics (average F1, average latency, TTFT, TPS) are reported per model.
+- The model must return JSON like `{"indices": [1, 4, 7]}`.
+- Precision/Recall/F1 are computed against the expected indices.
+
+**SQL.** Each test case is a natural-language question over a university schema (departments, professors, students, courses, offerings, enrollments).
+
+- The model must return a raw SQL query, no explanation.
+- Scoring executes both the expected and predicted queries against a test database and compares the sorted result sets.
+
+**Math.** Each test case is a problem from categories like derivatives, integrals, equations, probability, linear algebra, sequences, and word problems.
+
+- The model must return only the final answer in plain calculator notation.
+- Scoring tries string match, then set/matrix/numeric comparison (1e‑6 tolerance), then symbolic equivalence via SymPy (time‑boxed).
 
 ### Financial Model
 
@@ -189,11 +203,17 @@ pytest --cov=app --cov-report=term-missing
 │   ├── workflow.py       # LangGraph evaluation pipeline
 │   ├── engine.py         # Ollama inference and parsing
 │   ├── db.py             # SQLite schema and persistence
-│   └── schemas.py        # Request/response models
+│   ├── scorers.py        # Shared scoring helpers
+│   ├── tasks/            # Per-task prompt builders & scorers
+│   └── data/
+│       └── test_data.db  # SQL task fixture database
 ├── ui/
 │   └── dashboard.py      # Streamlit dashboard
 ├── data/
-│   ├── test_cases.json   # Benchmark dataset
+│   ├── extractiontests.py
+│   ├── sqltests.py
+│   ├── mathtests.py
+│   ├── debug_logs/       # Per-run passed/failed records (auto-created)
 │   └── benchmark_history.db  # (auto‑created)
 ├── tests/                # Unit tests for each module
 ├── docker-compose.yml
@@ -202,4 +222,3 @@ pytest --cov=app --cov-report=term-missing
 ├── .env.example
 └── README.md
 ```
-

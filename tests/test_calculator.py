@@ -324,7 +324,7 @@ def test_breakeven_zero_cluster_max_rps(base_cluster):
         cluster_max_rps=0.0,
     )
     assert res["feasible"] is False
-    assert res["utilization_pct"] == round((1.0 / 0.0001) * 100, 1) or res["utilization_pct"] > 100
+    assert res["utilization_pct"] == float("inf")
 
 
 @pytest.mark.parametrize("req_rps, max_rps, expected_util", [

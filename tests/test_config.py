@@ -160,20 +160,17 @@ def test_11_settings_default_values():
     assert settings.PROJECT_NAME == "ModelEval ROI Engine"
     assert settings.VERSION == "0.1.0"
     assert settings.OLLAMA_HOST == "http://localhost:11434"
-    assert settings.DEFAULT_MONTHLY_QUERY_SCALE == 1_000_000
     assert settings.DEFAULT_CLUSTER.name == "4xA4000-Inference-Node"
 
 
 def test_12_settings_environment_variable_override(monkeypatch):
     monkeypatch.setenv("PROJECT_NAME", "Custom ROI Engine")
     monkeypatch.setenv("OLLAMA_HOST", "http://ollama-container:11434")
-    monkeypatch.setenv("DEFAULT_MONTHLY_QUERY_SCALE", "5000000")
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-testkey123")
 
     custom_settings = Settings()
     assert custom_settings.PROJECT_NAME == "Custom ROI Engine"
     assert custom_settings.OLLAMA_HOST == "http://ollama-container:11434"
-    assert custom_settings.DEFAULT_MONTHLY_QUERY_SCALE == 5_000_000
     assert custom_settings.OPENROUTER_API_KEY == "sk-or-v1-testkey123"
 
 

@@ -62,7 +62,13 @@ DEFAULT_MODEL_REGISTRY: dict[str, ModelConfig] = {
         input_cost_per_1k=0.00003,
         output_cost_per_1k=0.00012,
     ),
-    
+    "qwen-legal:latest": ModelConfig(
+            name="qwen-legal:latest",
+            vram=1.6,
+            provider_alias="Local-be-UltraLite",
+            input_cost_per_1k=0.00003,
+            output_cost_per_1k=0.00012,
+        ),
     # 3B Class
     "llama3.2:3b": ModelConfig(
         name="llama3.2:3b",
@@ -125,11 +131,6 @@ class Settings(BaseSettings):
     )
     
     # Financial Scale Defaults
-    DEFAULT_MONTHLY_QUERY_SCALE: int = Field(
-        default=1_000_000,
-        description="Target query volume used to project simulated monthly ROI"
-    )
-    
     # OpenRouter / Cloud Synthesis Settings
     OPENROUTER_API_KEY: str = Field(
         default="",
